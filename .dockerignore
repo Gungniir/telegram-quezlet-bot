@@ -1,0 +1,8 @@
+.git
+.idea
+
+.gitignore
+
+dist
+
+release.bat

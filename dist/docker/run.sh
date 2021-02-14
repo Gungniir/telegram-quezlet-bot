@@ -1,4 +1,7 @@
 #!/bin/bash
 
+docker stop osat
+docker rm osat
+docker rmi osat:release
 docker load -i image.tar
-docker run -d --network osat run --name osat -e token=[insert your token here] osat
+docker run --restart always -d --network osat  --name osat osat:release

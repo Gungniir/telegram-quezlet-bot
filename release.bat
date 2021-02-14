@@ -1,2 +1,2 @@
-docker build -t osat .
-docker save -o dist/docker/image.tar osat
+docker build -t osat:release .
+docker save -o dist/docker/image.tar osat:release

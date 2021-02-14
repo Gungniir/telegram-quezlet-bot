@@ -114,7 +114,7 @@ func (p *Postgres) GetGroup(ctx context.Context, groupID int) (*models.Group, er
 func (p *Postgres) GetItemsByGroupID(ctx context.Context, groupID int) ([]*models.Item, error) {
 	pool := pgxpool.Pool(*p)
 
-	rows, err := pool.Query(ctx, `SELECT * FROM items WHERE group_id = $1 ORDER BY repeat_at DESC`, groupID)
+	rows, err := pool.Query(ctx, `SELECT * FROM items WHERE group_id = $1 ORDER BY repeat_at`, groupID)
 
 	if err != nil {
 		return nil, err
