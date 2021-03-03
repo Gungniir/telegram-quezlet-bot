@@ -7,6 +7,7 @@ import (
 	"github.com/gungniir/telegram-quezlet-bot/database"
 	"github.com/gungniir/telegram-quezlet-bot/models"
 	log "github.com/sirupsen/logrus"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -135,6 +136,8 @@ func (s *TgServer) listenUpdates(updates tgbotapi.UpdatesChannel) error {
 					err = s.commandItems(ctx, update.Message)
 				case "Добавить модуль":
 					err = s.commandCreateItem(ctx, update.Message)
+				default:
+					err = s.defaultMessage(ctx, update.Message)
 				}
 			} else {
 				switch s.stats.Get(update.Message.From.ID) {
@@ -615,4 +618,99 @@ func (s *TgServer) createItemSetName(ctx context.Context, msg *tgbotapi.Message)
 	m.Text = fmt.Sprintf("Отлично! Карточка добавлена :)\nПовторим её %d.%d.%d", item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year())
 	_, err = s.api.Send(m)
 	return err
+}
+
+func (s *TgServer) createItemConfirm(ctx context.Context, msg *tgbotapi.Message) error {
+	group := forGroup(ctx)
+	m := tgbotapi.NewMessage(msg.Chat.ID, "")
+
+	if group == nil {
+		m.Text = "Вы не состоите в группе"
+		_, err := s.api.Send(m)
+		return err
+	}
+
+	name := msg.Text
+
+	if !(*models.Item).CheckName(nil, name) {
+		m.Text = "Ухх, плохое название, придумайте другое"
+		_, err := s.api.Send(m)
+		return err
+	}
+
+	url := s.userContexts.Get(msg.From.ID, "CreateItem_URL")
+
+	if !(*models.Item).CheckURL(nil, url) {
+		m.Text = "Что-то у меня амнезия... Я ссылку-то уде забыл... Давайте заново? Введите /cancel"
+		_, err := s.api.Send(m)
+		return err
+	}
+
+	item, err := s.db.CreateItem(ctx, group.ID, url, name)
+
+	if err != nil {
+		log.WithError(err).Error("Failed to create item")
+		m.Text = "Тэкс... Я не смогу записать... Повторите, пожалуйста, еще раз..."
+		_, err := s.api.Send(m)
+		return err
+	}
+
+	s.stats.Set(msg.From.ID, UStatusUndefined)
+
+	m.Text = fmt.Sprintf("Отлично! Карточка добавлена :)\nНазвание: %s\nСсылка: [тыц](%s)\nПовторим её %d.%d.%d", item.Name, item.URL, item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year())
+	m.ParseMode = tgbotapi.ModeMarkdown
+	m.ReplyMarkup = kbForAuthed
+
+	_, err = s.api.Send(m)
+	return err
+}
+
+func (s *TgServer) defaultMessage(ctx context.Context, msg *tgbotapi.Message) error {
+	group := forGroup(ctx)
+
+	newModuleRegex := regexp.MustCompile(`^(?:Я изучаю|Studying) ([\w\dА-Яа-я ():,.\-\\/&]{3,128}) (?:на|on) Quizlet: (http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+)$`)
+
+	switch {
+	case group != nil && newModuleRegex.MatchString(msg.Text):
+		values := newModuleRegex.FindAllStringSubmatch(msg.Text, 1)
+		name := values[0][1]
+		url := values[0][2]
+
+		m := tgbotapi.NewMessage(msg.Chat.ID, "")
+
+		item, err := s.db.CreateItem(ctx, group.ID, url, name)
+
+		if err != nil {
+			log.WithError(err).Error("Failed to create item")
+			m.Text = "Тэкс... Я не смогу записать... Повторите, пожалуйста, еще раз..."
+			_, err := s.api.Send(m)
+			return err
+		}
+
+		s.stats.Set(msg.From.ID, UStatusUndefined)
+
+		m.Text = fmt.Sprintf("Отлично! Карточка добавлена :)\nНазвание: %s\nСсылка: [тыц](%s)\nПовторим её %d.%d.%d", item.Name, item.URL, item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year())
+		m.ParseMode = tgbotapi.ModeMarkdown
+		m.ReplyMarkup = kbForAuthed
+
+		_, err = s.api.Send(m)
+		return err
+	default:
+		m := tgbotapi.NewMessage(msg.Chat.ID, "Не понимаю, что вы имели в виду...")
+
+		if group != nil {
+			m.ReplyMarkup = kbForAuthed
+		} else {
+			m.ReplyMarkup = kbForNew
+		}
+
+		_, err := s.api.Send(m)
+
+		if err != nil {
+			log.WithError(err).Error("Failed to send default msg")
+			return err
+		}
+	}
+
+	return nil
 }

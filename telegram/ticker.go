@@ -67,14 +67,23 @@ func (t *Ticker) tick() {
 		return
 	}
 
-	for _, chatIDs := range chatIDs {
-		for _, chatID := range chatIDs {
-			m := tgbotapi.NewMessage(chatID, "Доброе утро! Соскучились по модулям? А они-то как по вас?)\nВ общем, пора учиться :)")
+	{
+		notified := make(map[int64]bool)
 
-			_, err := t.api.Send(m)
+		for _, chatIDs := range chatIDs {
+			for _, chatID := range chatIDs {
+				if notified[chatID] {
+					continue
+				}
+				notified[chatID] = true
 
-			if err != nil {
-				log.WithError(err).Warn("Failed to send message to chat")
+				m := tgbotapi.NewMessage(chatID, "Доброе утро! Соскучились по модулям? А они-то как по вас?)\nВ общем, пора учиться :)")
+
+				_, err := t.api.Send(m)
+
+				if err != nil {
+					log.WithError(err).Warn("Failed to send message to chat")
+				}
 			}
 		}
 	}
