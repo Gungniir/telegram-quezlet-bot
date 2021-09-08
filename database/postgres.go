@@ -32,7 +32,7 @@ func (p *Postgres) CreateGroup(ctx context.Context, passwordHash string) (*model
 	return group, nil
 }
 
-func (p *Postgres) SetUserGroup(ctx context.Context, userID, groupID int) error {
+func (p *Postgres) AddUserToGroup(ctx context.Context, userID, groupID int) error {
 	pool := pgxpool.Pool(*p)
 
 	_, err := pool.Exec(ctx, `INSERT INTO groups_users_links(user_id, group_id) VALUES ($1, $2)`, userID, groupID)
@@ -40,7 +40,7 @@ func (p *Postgres) SetUserGroup(ctx context.Context, userID, groupID int) error 
 	return err
 }
 
-func (p *Postgres) GetUserGroup(ctx context.Context, userID int) (*models.Group, error) {
+func (p *Postgres) GetUserGroups(ctx context.Context, userID int) ([]*models.Group, error) {
 	pool := pgxpool.Pool(*p)
 	rows, err := pool.Query(ctx, `SELECT g.* FROM groups_users_links INNER JOIN groups g on g.id = groups_users_links.group_id WHERE user_id = $1`, userID)
 
@@ -50,19 +50,21 @@ func (p *Postgres) GetUserGroup(ctx context.Context, userID int) (*models.Group,
 
 	defer rows.Close()
 
-	if !rows.Next() {
-		return nil, nil
+	var groups []*models.Group
+
+	for rows.Next() {
+		group := &models.Group{}
+
+		err = rows.Scan(&group.ID, &group.PasswordHash)
+
+		if err != nil {
+			return nil, err
+		}
+
+		groups = append(groups, group)
 	}
 
-	group := &models.Group{}
-
-	err = rows.Scan(&group.ID, &group.PasswordHash)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return group, nil
+	return groups, nil
 }
 
 func NewPostgres(connString string) (*Postgres, error) {
@@ -77,10 +79,10 @@ func NewPostgres(connString string) (*Postgres, error) {
 	return &p, nil
 }
 
-func (p *Postgres) RemoveUserGroup(ctx context.Context, userID int) error {
+func (p *Postgres) RemoveUserFromGroup(ctx context.Context, userID, groupID int) error {
 	pool := pgxpool.Pool(*p)
 
-	_, err := pool.Exec(ctx, `DELETE FROM groups_users_links WHERE user_id = $1`, userID)
+	_, err := pool.Exec(ctx, `DELETE FROM groups_users_links WHERE user_id = $1 AND group_id = $2`, userID, groupID)
 
 	return err
 }
@@ -205,7 +207,7 @@ func (p *Postgres) GetChatIDsByUserIDs(ctx context.Context, userIDs []int) (map[
 func (p *Postgres) GetTodayItems(ctx context.Context) ([]*models.Item, error) {
 	pool := pgxpool.Pool(*p)
 
-	rows, err := pool.Query(ctx, `SELECT * FROM items WHERE repeat_at = current_date`)
+	rows, err := pool.Query(ctx, `SELECT * FROM items WHERE repeat_at = current_date ORDER BY group_id, id`)
 
 	if err != nil {
 		return nil, err
@@ -261,7 +263,7 @@ func (p *Postgres) GetChatIDsByItemIDs(ctx context.Context, itemIDs []int) (map[
 	return items, nil
 }
 
-func (p *Postgres) NextItemByItemIDWithCheck(ctx context.Context, itemID, counter int) error {
+func (p *Postgres) ProlongByItemIDWithCheck(ctx context.Context, itemID, counter int) error {
 	pool := pgxpool.Pool(*p)
 
 	_, err := pool.Exec(ctx, `UPDATE items SET repeat_at = current_date + (SELECT add FROM prolong WHERE count = (SELECT counter FROM items WHERE id = $1 LIMIT 1) LIMIT 1), counter = $2 + 1 WHERE id = $1 AND counter = $2`, itemID, counter)
@@ -269,7 +271,7 @@ func (p *Postgres) NextItemByItemIDWithCheck(ctx context.Context, itemID, counte
 	return err
 }
 
-func (p *Postgres) NextDayYesterdayItem(ctx context.Context) error {
+func (p *Postgres) ProlongYesterdayItem(ctx context.Context) error {
 	pool := pgxpool.Pool(*p)
 
 	_, err := pool.Exec(ctx, `UPDATE items SET repeat_at = current_date WHERE repeat_at < current_date`)

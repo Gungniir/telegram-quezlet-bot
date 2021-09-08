@@ -34,6 +34,11 @@ const (
 	UStatusJoinGroupCheckGroup
 	UStatusJoinGroupCheckPassword
 
+	UStatusCreateItemChoseGroup
 	UStatusCreateItemSetURL
 	UStatusCreateItemSetName
+
+	UStatusCreateFullItemChoseGroup
+
+	UStatusLeaveGroupChoseGroup
 )

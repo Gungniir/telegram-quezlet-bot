@@ -37,7 +37,7 @@ func (t *Ticker) StartTicker(api *tgbotapi.BotAPI, db database.Database) {
 func (t *Ticker) tick() {
 	log.Info("Tick")
 
-	err := t.db.NextDayYesterdayItem(context.Background())
+	err := t.db.ProlongYesterdayItem(context.Background())
 
 	if err != nil {
 		log.WithError(err).Error("Failed to prolong yesterday packages")
@@ -88,8 +88,22 @@ func (t *Ticker) tick() {
 		}
 	}
 
+	lastGroups := make(map[int64]int)
+
 	for _, item := range items {
 		for _, chatID := range chatIDs[item.ID] {
+			lastGroup := lastGroups[chatID]
+
+			if lastGroup != item.GroupID {
+				m := tgbotapi.NewMessage(chatID, fmt.Sprintf("*Модули группы √%d*", item.GroupID))
+				m.ParseMode = tgbotapi.ModeMarkdown
+
+				_, err = t.api.Send(m)
+				log.WithError(err).Warn("Failed to send message to chat")
+
+				lastGroups[chatID] = item.GroupID
+			}
+
 			m := tgbotapi.NewMessage(chatID,
 				fmt.Sprintf("%s\n[Тыц по ссылке](%s)", item.Name, item.URL),
 			)

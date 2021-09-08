@@ -12,26 +12,39 @@ import (
 	"strings"
 )
 
-const groupKey = "groupKey"
+var newModuleRegex = regexp.MustCompile(`^(?:Я изучаю|Studying) ([\w\dА-Яа-я ():,.\-\\/&]{3,128}) (?:на|on) Quizlet: (http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+)$`)
 
-func forGroup(ctx context.Context) *models.Group {
-	return ctx.Value(groupKey).(*models.Group)
+const (
+	groupKey                    = "groupKey"
+	msgYouDoNotBelongToAnyGroup = "Вы не состоите в группе"
+
+	butCreateNewGroup = "Создать свою группу"
+	butJoinGroup      = "Присоединиться к группе"
+	butAddModule      = "Добавить модуль"
+	butGetSchedule    = "Расписание повторений"
+	butLeaveGroup     = "Покинуть группу"
+)
+
+func forGroup(ctx context.Context) []*models.Group {
+	return ctx.Value(groupKey).([]*models.Group)
 }
 
 var (
 	kbForNew = tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton("Создать свою группу"),
-			tgbotapi.NewKeyboardButton("Присоединиться к группе"),
+			tgbotapi.NewKeyboardButton(butCreateNewGroup),
+			tgbotapi.NewKeyboardButton(butJoinGroup),
 		),
 	)
 	kbForAuthed = tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton("Добавить модуль"),
-			tgbotapi.NewKeyboardButton("Расписание повторений"),
+			tgbotapi.NewKeyboardButton(butAddModule),
+			tgbotapi.NewKeyboardButton(butGetSchedule),
 		),
 		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton("Выйти из группы"),
+			tgbotapi.NewKeyboardButton(butCreateNewGroup),
+			tgbotapi.NewKeyboardButton(butJoinGroup),
+			tgbotapi.NewKeyboardButton(butLeaveGroup),
 		),
 	)
 )
@@ -51,6 +64,15 @@ type TgServer struct {
 
 func (s *TgServer) ListenAndServe(db database.Database) error {
 	api, err := tgbotapi.NewBotAPI(s.Config.Token)
+
+	wbInfo, err := api.GetWebhookInfo()
+
+	if wbInfo.IsSet() {
+		log.Warn("Webhook is set")
+		log.Warn(wbInfo.URL)
+
+		api.RemoveWebhook()
+	}
 
 	if err != nil {
 		return err
@@ -75,22 +97,22 @@ func (s *TgServer) listenUpdates(updates tgbotapi.UpdatesChannel) error {
 	ctx := context.Background()
 	for update := range updates {
 		if update.Message != nil {
-			group, err := s.db.GetUserGroup(ctx, update.Message.From.ID)
+			groups, err := s.db.GetUserGroups(ctx, update.Message.From.ID)
 
 			if err != nil {
 				log.WithError(err).Warn("Failed to get user group")
 			} else {
-				ctx = context.WithValue(ctx, groupKey, group)
+				ctx = context.WithValue(ctx, groupKey, groups)
 			}
 
 			_ = s.db.SetChatIDByUserID(ctx, update.Message.Chat.ID, update.Message.From.ID)
 		} else if update.CallbackQuery != nil {
-			group, err := s.db.GetUserGroup(ctx, update.CallbackQuery.From.ID)
+			groups, err := s.db.GetUserGroups(ctx, update.CallbackQuery.From.ID)
 
 			if err != nil {
 				log.WithError(err).Warn("Failed to get user group")
 			} else {
-				ctx = context.WithValue(ctx, groupKey, group)
+				ctx = context.WithValue(ctx, groupKey, groups)
 			}
 
 			_ = s.db.SetChatIDByUserID(ctx, update.CallbackQuery.Message.Chat.ID, update.CallbackQuery.Message.From.ID)
@@ -126,15 +148,15 @@ func (s *TgServer) listenUpdates(updates tgbotapi.UpdatesChannel) error {
 
 			if status == UStatusUndefined {
 				switch update.Message.Text {
-				case "Создать свою группу":
+				case butCreateNewGroup:
 					err = s.createGroupStart(ctx, update.Message)
-				case "Присоединиться к группе":
+				case butJoinGroup:
 					err = s.joinGroupStart(ctx, update.Message)
-				case "Выйти из группы":
+				case butLeaveGroup:
 					err = s.commandQuit(ctx, update.Message)
-				case "Расписание повторений":
+				case butGetSchedule:
 					err = s.commandItems(ctx, update.Message)
-				case "Добавить модуль":
+				case butAddModule:
 					err = s.commandCreateItem(ctx, update.Message)
 				default:
 					err = s.defaultMessage(ctx, update.Message)
@@ -149,8 +171,14 @@ func (s *TgServer) listenUpdates(updates tgbotapi.UpdatesChannel) error {
 					err = s.joinGroupCheckPassword(ctx, update.Message)
 				case UStatusCreateItemSetURL:
 					err = s.createItemSetURL(ctx, update.Message)
+				case UStatusCreateItemChoseGroup:
+					err = s.createItemChoseGroup(ctx, update.Message)
 				case UStatusCreateItemSetName:
 					err = s.createItemSetName(ctx, update.Message)
+				case UStatusCreateFullItemChoseGroup:
+					err = s.createFullItemChoseGroup(ctx, update.Message)
+				case UStatusLeaveGroupChoseGroup:
+					err = s.leaveGroupChoseGroup(ctx, update.Message)
 				}
 			}
 
@@ -214,7 +242,7 @@ func (s *TgServer) queryOk(ctx context.Context, query *tgbotapi.CallbackQuery) e
 		return nil
 	}
 
-	err = s.db.NextItemByItemIDWithCheck(ctx, itemID, counter)
+	err = s.db.ProlongByItemIDWithCheck(ctx, itemID, counter)
 
 	if err != nil {
 		log.WithError(err).Warn("Failed to next item")
@@ -227,10 +255,18 @@ func (s *TgServer) queryOk(ctx context.Context, query *tgbotapi.CallbackQuery) e
 // Commands
 
 func (s *TgServer) commandHelp(_ context.Context, msg *tgbotapi.Message) error {
-	_, err := s.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+	m := tgbotapi.NewMessage(msg.Chat.ID,
 		"Я напоминаю вам, каждый раз, когда приходит время освежить в памяти какие-нибудь карточки\n"+
-			"• /help - Вывести данное сообщение",
-	))
+			"• /help - Вывести данное сообщение\n"+
+			"• /cancel - Сбросить состояние, вернуться в главное меню\n",
+	)
+
+	kb := kbForAuthed
+	kb.OneTimeKeyboard = true
+
+	m.ReplyMarkup = kb
+
+	_, err := s.api.Send(m)
 
 	return err
 }
@@ -238,14 +274,24 @@ func (s *TgServer) commandHelp(_ context.Context, msg *tgbotapi.Message) error {
 func (s *TgServer) commandStart(ctx context.Context, msg *tgbotapi.Message) error {
 	var text string
 	var kb tgbotapi.ReplyKeyboardMarkup
-	group := forGroup(ctx)
+	groups := forGroup(ctx)
 
-	if group == nil {
+	if groups == nil {
 		text = "Я напоминаю вам, каждый раз, когда приходит время освежить в памяти какие-нибудь карточки\n" +
 			"Давайте начнём!"
 		kb = kbForNew
+	} else if len(groups) == 1 {
+		text = "С возвращением! Вы находитесь в группе √" + strconv.Itoa(groups[0].ID)
+		kb = kbForAuthed
 	} else {
-		text = "С возвращением! Вы находитесь в группе √" + strconv.Itoa(group.ID)
+		text = "С возвращением! Вы находитесь в группах √"
+
+		for _, group := range groups {
+			text += fmt.Sprintf("%d, ", group.ID)
+		}
+
+		text = text[:len(text)-2] // Удаляем лишний пробел и запятую
+
 		kb = kbForAuthed
 	}
 
@@ -285,57 +331,98 @@ func (s *TgServer) commandCancel(ctx context.Context, msg *tgbotapi.Message) err
 }
 
 func (s *TgServer) commandQuit(ctx context.Context, msg *tgbotapi.Message) error {
-	kb := kbForNew
-	kb.OneTimeKeyboard = true
+	groups := forGroup(ctx)
 
-	err := s.db.RemoveUserGroup(ctx, msg.From.ID)
+	if len(groups) == 1 {
+		kb := kbForNew
+		kb.OneTimeKeyboard = true
 
-	if err != nil {
-		log.WithError(err).Warn("Failed to remove user from group")
+		err := s.db.RemoveUserFromGroup(ctx, msg.From.ID, groups[0].ID)
+
+		if err != nil {
+			log.WithError(err).Warn("Failed to remove user from group")
+
+			m := tgbotapi.NewMessage(msg.Chat.ID,
+				"Не удалось выйти из группы, увы :(",
+			)
+
+			_, err = s.api.Send(m)
+			return err
+		}
 
 		m := tgbotapi.NewMessage(msg.Chat.ID,
-			"Не удалось выйти из группы, увы :(",
+			fmt.Sprintf("Вы вышли из группы √%d", groups[0].ID),
 		)
+
+		m.ReplyMarkup = kb
+
+		s.stats.Set(msg.From.ID, UStatusUndefined)
 
 		_, err = s.api.Send(m)
 		return err
+	} else if len(groups) == 0 {
+		kb := kbForNew
+		kb.OneTimeKeyboard = true
+
+		m := tgbotapi.NewMessage(msg.Chat.ID, "Вы не находитесь в группе")
+		m.ReplyMarkup = kb
+
+		s.stats.Set(msg.From.ID, UStatusUndefined)
+
+		_, err := s.api.Send(m)
+		return err
 	}
 
-	m := tgbotapi.NewMessage(msg.Chat.ID,
-		"Вы вышли из группы",
-	)
+	m := tgbotapi.NewMessage(msg.Chat.ID, "Выберите группу, из которой хотите выйти")
 
-	m.ReplyMarkup = kb
+	_, err := s.api.Send(m)
 
-	s.stats.Set(msg.From.ID, UStatusUndefined)
+	if err != nil {
+		return err
+	}
 
+	m.Text = "Вы на ходитесь в группах √"
+
+	for _, group := range groups {
+		m.Text += fmt.Sprintf("%d, ", group.ID)
+	}
+
+	m.Text = m.Text[:len(m.Text)-2] // Убираем лишний пробел и запятую
 	_, err = s.api.Send(m)
+
+	s.stats.Set(msg.From.ID, UStatusLeaveGroupChoseGroup)
+
 	return err
 }
 
 func (s *TgServer) commandItems(ctx context.Context, msg *tgbotapi.Message) error {
 	var kb tgbotapi.ReplyKeyboardMarkup
 	var text string
-	group := forGroup(ctx)
+	groups := forGroup(ctx)
 
-	if group == nil {
+	if groups == nil {
 		kb = kbForNew
-		text = "Вы не состоите в группе"
+		text = msgYouDoNotBelongToAnyGroup
 	} else {
 		kb = kbForAuthed
-		text = "*Расписание*\n"
 
-		items, err := s.db.GetItemsByGroupID(ctx, group.ID)
+		for _, group := range groups {
+			text += fmt.Sprintf("\n\n*Расписание группы √%d*\n", group.ID)
 
-		if err != nil {
-			text = "Не удалось получить расписание"
-		} else {
-			for i, item := range items {
-				text += fmt.Sprintf("\n%d. (%d.%d.%d) %s\nСсылка на модуль: [тыц](%s)",
-					i+1, item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year(), item.Name, item.URL,
-				)
+			items, err := s.db.GetItemsByGroupID(ctx, group.ID)
+
+			if err != nil {
+				text = "Не удалось получить расписание"
+			} else {
+				for i, item := range items {
+					text += fmt.Sprintf("\n%d. (%02d.%02d.%d) %s\nСсылка на модуль: [тыц](%s)",
+						i+1, item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year(), item.Name, item.URL,
+					)
+				}
 			}
 		}
+
+		text = text[2:] // Убираем начальный \n
 	}
 
 	kb.OneTimeKeyboard = true
@@ -349,9 +436,18 @@ func (s *TgServer) commandItems(ctx context.Context, msg *tgbotapi.Message) erro
 	return err
 }
 
-func (s *TgServer) commandTick(_ context.Context, _ *tgbotapi.Message) error {
+func (s *TgServer) commandTick(_ context.Context, msg *tgbotapi.Message) error {
 	s.ticker.tick()
-	return nil
+
+	m := tgbotapi.NewMessage(msg.Chat.ID, "Успешный тик")
+
+	kb := kbForAuthed
+	kb.OneTimeKeyboard = true
+
+	m.ReplyMarkup = kb
+
+	_, err := s.api.Send(m)
+	return err
 }
 
 func (s *TgServer) commandCreateItem(ctx context.Context, msg *tgbotapi.Message) error {
@@ -361,11 +457,24 @@ func (s *TgServer) commandCreateItem(ctx context.Context, msg *tgbotapi.Message)
 	if group == nil {
 		kb := kbForNew
 		kb.OneTimeKeyboard = true
-		m.Text = "Вы не состоите в группе"
+		m.Text = msgYouDoNotBelongToAnyGroup
 		m.ReplyMarkup = kb
-	} else {
+	} else if len(group) == 1 {
 		m.Text = "Новый модуль? Ок... Скиньте ссылку на него"
+
+		kb := kbForAuthed
+		kb.OneTimeKeyboard = true
+
+		m.ReplyMarkup = kb
 		s.stats.Set(msg.From.ID, UStatusCreateItemSetURL)
+	} else {
+		m.Text = "Новый модуль? Ок... В какую группу вы хотите его добавить?"
+
+		kb := kbForAuthed
+		kb.OneTimeKeyboard = true
+
+		m.ReplyMarkup = kb
+		s.stats.Set(msg.From.ID, UStatusCreateItemChoseGroup)
 	}
 
 	_, err := s.api.Send(m)
@@ -377,12 +486,37 @@ func (s *TgServer) commandCreateItem(ctx context.Context, msg *tgbotapi.Message)
 func (s *TgServer) createGroupStart(ctx context.Context, msg *tgbotapi.Message) error {
 	var text string
 
-	if forGroup(ctx) != nil {
-		text = "Вы уже состоите в группе. Чтобы покинуть её введите /quit"
-	} else {
-		s.stats.Set(msg.From.ID, UStatusCreateGroupSetPassword)
-		text = "Ок, придумайте пароль (как минимум 3 символа латиницей или цифрами)"
+	groups := forGroup(ctx)
+
+	if groups != nil {
+		text = "Напоминаю, что вы состоите в "
+
+		if len(groups) > 1 {
+			text += "группах"
+		} else {
+			text += "группе"
+		}
+
+		text += " √"
+
+		for _, group := range groups {
+			text += fmt.Sprintf("%d, ", group.ID)
+		}
+
+		text = text[:len(text)-2] // Удаляем ненужную последнюю запятую и пробел
+
+		m := tgbotapi.NewMessage(msg.Chat.ID, text)
+
+		_, err := s.api.Send(m)
+
+		if err != nil {
+			return err
+		}
 	}
+
+	s.stats.Set(msg.From.ID, UStatusCreateGroupSetPassword)
+
+	text = "Придумайте пароль (как минимум 3 символа латиницей или цифрами)"
 
 	m := tgbotapi.NewMessage(msg.Chat.ID, text)
 
@@ -412,7 +546,7 @@ func (s *TgServer) createGroupSetPassword(_ context.Context, msg *tgbotapi.Messa
 		return err
 	}
 
-	err = s.db.SetUserGroup(context.Background(), msg.From.ID, group.ID)
+	err = s.db.AddUserToGroup(context.Background(), msg.From.ID, group.ID)
 
 	if err != nil {
 		log.WithError(err).Warn("Failed to attach user to group")
@@ -427,7 +561,11 @@ func (s *TgServer) createGroupSetPassword(_ context.Context, msg *tgbotapi.Messa
 		"Отлично, группа создана!\n"+
 			"Вы можете пригласить в нее друзей по ID: "+strconv.Itoa(group.ID),
 	)
-	m.ReplyMarkup = kbForAuthed
+
+	kb := kbForAuthed
+	kb.OneTimeKeyboard = true
+
+	m.ReplyMarkup = kb
 
 	s.stats.Set(msg.From.ID, UStatusUndefined)
 
@@ -440,12 +578,36 @@ func (s *TgServer) createGroupSetPassword(_ context.Context, msg *tgbotapi.Messa
 func (s *TgServer) joinGroupStart(ctx context.Context, msg *tgbotapi.Message) error {
 	var text string
 
-	if forGroup(ctx) != nil {
-		text = "Вы уже состоите в группе. Чтобы покинуть её введите /quit"
-	} else {
-		s.stats.Set(msg.From.ID, UStatusJoinGroupCheckGroup)
-		text = "Ок, введите ID группы, к которой хотите присоединиться"
+	groups := forGroup(ctx)
+
+	if groups != nil {
+		text = "Напоминаю, что вы состоите в "
+
+		if len(groups) > 1 {
+			text += "группах"
+		} else {
+			text += "группе"
+		}
+
+		text += " √"
+
+		for _, group := range groups {
+			text += fmt.Sprintf("%d, ", group.ID)
+		}
+
+		text = text[:len(text)-2] // Удаляем ненужную последнюю запятую и пробел
+
+		m := tgbotapi.NewMessage(msg.Chat.ID, text)
+
+		_, err := s.api.Send(m)
+
+		if err != nil {
+			return err
+		}
 	}
+
+	s.stats.Set(msg.From.ID, UStatusJoinGroupCheckGroup)
+	text = "Введите ID группы, к которой хотите присоединиться"
 
 	m := tgbotapi.NewMessage(msg.Chat.ID, text)
 
@@ -531,7 +693,7 @@ func (s *TgServer) joinGroupCheckPassword(ctx context.Context, msg *tgbotapi.Mes
 		return err
 	}
 
-	err = s.db.SetUserGroup(ctx, msg.From.ID, group.ID)
+	err = s.db.AddUserToGroup(ctx, msg.From.ID, group.ID)
 
 	if err != nil {
 		m := tgbotapi.NewMessage(msg.Chat.ID, "Не удалось добавить вас в группу, попробуйте ещё раз")
@@ -541,7 +703,11 @@ func (s *TgServer) joinGroupCheckPassword(ctx context.Context, msg *tgbotapi.Mes
 	}
 
 	m := tgbotapi.NewMessage(msg.Chat.ID, "Добро пожаловать в группу √"+strconv.Itoa(group.ID))
-	m.ReplyMarkup = kbForAuthed
+
+	kb := kbForAuthed
+	kb.OneTimeKeyboard = true
+
+	m.ReplyMarkup = kb
 
 	s.stats.Set(msg.From.ID, UStatusUndefined)
 
@@ -552,12 +718,65 @@ func (s *TgServer) joinGroupCheckPassword(ctx context.Context, msg *tgbotapi.Mes
 
 // CreateItemFunctions
 
+func (s *TgServer) createItemChoseGroup(ctx context.Context, msg *tgbotapi.Message) error {
+	groups := forGroup(ctx)
+	m := tgbotapi.NewMessage(msg.Chat.ID, "")
+
+	if groups == nil {
+		m.Text = msgYouDoNotBelongToAnyGroup
+		_, err := s.api.Send(m)
+		return err
+	} else if len(groups) == 1 {
+		s.userContexts.Set(msg.From.ID, "CreateItem_Group", strconv.Itoa(groups[0].ID))
+		m.Text = fmt.Sprintf("Выбрана группа √%d", groups[0].ID)
+		_, err := s.api.Send(m)
+		if err != nil {
+			return err
+		}
+		m.Text = "А теперь скиньте ссылку на модуль"
+		_, err = s.api.Send(m)
+		s.stats.Set(msg.From.ID, UStatusCreateItemSetURL)
+		return err
+	}
+
+	groupID, err := strconv.Atoi(msg.Text)
+
+	if err != nil {
+		m.Text = "Вы уверены, что ввели число без всяких знаков? Повторите, пожалуйста, ещё раз"
+		_, err = s.api.Send(m)
+		return err
+	}
+
+	var allowed bool
+
+	for _, group := range groups {
+		if group.ID == groupID {
+			allowed = true
+			break
+		}
+	}
+
+	if !allowed {
+		m.Text = fmt.Sprintf("Вы не входите в группу √%d", groupID)
+		_, err = s.api.Send(m)
+		return err
+	}
+
+	s.userContexts.Set(msg.From.ID, "CreateItem_Group", strconv.Itoa(groupID))
+	s.stats.Set(msg.From.ID, UStatusCreateItemSetURL)
+
+	m.Text = "Отлично! А теперь скиньте ссылку на модуль"
+	_, err = s.api.Send(m)
+
+	return err
+}
+
 func (s *TgServer) createItemSetURL(ctx context.Context, msg *tgbotapi.Message) error {
 	group := forGroup(ctx)
 	m := tgbotapi.NewMessage(msg.Chat.ID, "")
 
 	if group == nil {
-		m.Text = "Вы не состоите в группе"
+		m.Text = msgYouDoNotBelongToAnyGroup
 		_, err := s.api.Send(m)
 		return err
 	}
@@ -579,11 +798,11 @@ func (s *TgServer) createItemSetURL(ctx context.Context, msg *tgbotapi.Message) 
 }
 
 func (s *TgServer) createItemSetName(ctx context.Context, msg *tgbotapi.Message) error {
-	group := forGroup(ctx)
+	groups := forGroup(ctx)
 	m := tgbotapi.NewMessage(msg.Chat.ID, "")
 
-	if group == nil {
-		m.Text = "Вы не состоите в группе"
+	if groups == nil {
+		m.Text = msgYouDoNotBelongToAnyGroup
 		_, err := s.api.Send(m)
 		return err
 	}
@@ -599,12 +818,28 @@ func (s *TgServer) createItemSetName(ctx context.Context, msg *tgbotapi.Message)
 	url := s.userContexts.Get(msg.From.ID, "CreateItem_URL")
 
 	if !(*models.Item).CheckURL(nil, url) {
-		m.Text = "Что-то у меня амнезия... Я ссылку-то уде забыл... Давайте заново? Введите /cancel"
+		m.Text = "Что-то у меня амнезия... Я ссылку-то уже забыл... Давайте заново? Введите /cancel"
 		_, err := s.api.Send(m)
 		return err
 	}
 
-	item, err := s.db.CreateItem(ctx, group.ID, url, name)
+	rawGroupID := s.userContexts.Get(msg.From.ID, "CreateItem_Group")
+
+	if len(groups) > 1 && rawGroupID == "" {
+		m.Text = "Что-то у меня амнезия... Я выбранную группу уже забыл... Давайте заново? Введите /cancel"
+		_, err := s.api.Send(m)
+		return err
+	}
+
+	var item *models.Item
+	var err error
+
+	if len(groups) > 1 {
+		groupID, _ := strconv.Atoi(rawGroupID)
+		item, err = s.db.CreateItem(ctx, groupID, url, name)
+	} else {
+		item, err = s.db.CreateItem(ctx, groups[0].ID, url, name)
+	}
 
 	if err != nil {
 		log.WithError(err).Error("Failed to create item")
@@ -615,38 +850,79 @@ func (s *TgServer) createItemSetName(ctx context.Context, msg *tgbotapi.Message)
 
 	s.stats.Set(msg.From.ID, UStatusUndefined)
 
-	m.Text = fmt.Sprintf("Отлично! Карточка добавлена :)\nПовторим её %d.%d.%d", item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year())
+	kb := kbForAuthed
+	kb.OneTimeKeyboard = true
+
+	m.ReplyMarkup = kb
+
+	m.Text = fmt.Sprintf("Отлично! Карточка добавлена :)\nПовторим её %02d.%02d.%d", item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year())
 	_, err = s.api.Send(m)
 	return err
 }
 
-func (s *TgServer) createItemConfirm(ctx context.Context, msg *tgbotapi.Message) error {
-	group := forGroup(ctx)
+// create full item functions
+
+func (s *TgServer) createFullItemChoseGroup(ctx context.Context, msg *tgbotapi.Message) error {
+	groups := forGroup(ctx)
 	m := tgbotapi.NewMessage(msg.Chat.ID, "")
 
-	if group == nil {
-		m.Text = "Вы не состоите в группе"
+	if groups == nil {
+		m.Text = msgYouDoNotBelongToAnyGroup
 		_, err := s.api.Send(m)
+		return err
+	} else if len(groups) == 1 {
+		s.userContexts.Set(msg.From.ID, "CreateFullItem_Group", strconv.Itoa(groups[0].ID))
+		m.Text = fmt.Sprintf("Выбрана группа √%d", groups[0].ID)
+		_, err := s.api.Send(m)
+		if err != nil {
+			return err
+		}
+		s.stats.Set(msg.From.ID, UStatusUndefined)
+		return s.createFullItemProcess(ctx, msg)
+	}
+
+	groupID, err := strconv.Atoi(msg.Text)
+
+	if err != nil {
+		m.Text = "Вы уверены, что ввели число без всяких знаков? Повторите, пожалуйста, ещё раз"
+		_, err = s.api.Send(m)
 		return err
 	}
 
-	name := msg.Text
+	var allowed bool
 
-	if !(*models.Item).CheckName(nil, name) {
-		m.Text = "Ухх, плохое название, придумайте другое"
-		_, err := s.api.Send(m)
+	for _, group := range groups {
+		if group.ID == groupID {
+			allowed = true
+			break
+		}
+	}
+
+	if !allowed {
+		m.Text = fmt.Sprintf("Вы не входите в группу √%d", groupID)
+		_, err = s.api.Send(m)
 		return err
 	}
 
-	url := s.userContexts.Get(msg.From.ID, "CreateItem_URL")
+	s.userContexts.Set(msg.From.ID, "CreateFullItem_Group", strconv.Itoa(groupID))
+	s.stats.Set(msg.From.ID, UStatusUndefined)
 
-	if !(*models.Item).CheckURL(nil, url) {
-		m.Text = "Что-то у меня амнезия... Я ссылку-то уде забыл... Давайте заново? Введите /cancel"
-		_, err := s.api.Send(m)
-		return err
-	}
+	return s.createFullItemProcess(ctx, msg)
+}
 
-	item, err := s.db.CreateItem(ctx, group.ID, url, name)
+func (s *TgServer) createFullItemProcess(ctx context.Context, msg *tgbotapi.Message) error {
+	rawModule := s.userContexts.Get(msg.From.ID, "CreateFullItem_Module")
+	rawGroupID := s.userContexts.Get(msg.From.ID, "CreateFullItem_Group")
+
+	groupID, _ := strconv.Atoi(rawGroupID)
+
+	values := newModuleRegex.FindAllStringSubmatch(rawModule, 1)
+	name := values[0][1]
+	url := values[0][2]
+
+	m := tgbotapi.NewMessage(msg.Chat.ID, "")
+
+	item, err := s.db.CreateItem(ctx, groupID, url, name)
 
 	if err != nil {
 		log.WithError(err).Error("Failed to create item")
@@ -657,7 +933,7 @@ func (s *TgServer) createItemConfirm(ctx context.Context, msg *tgbotapi.Message)
 
 	s.stats.Set(msg.From.ID, UStatusUndefined)
 
-	m.Text = fmt.Sprintf("Отлично! Карточка добавлена :)\nНазвание: %s\nСсылка: [тыц](%s)\nПовторим её %d.%d.%d", item.Name, item.URL, item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year())
+	m.Text = fmt.Sprintf("Отлично! Карточка добавлена в группу √%d :)\nНазвание: %s\nСсылка: [тыц](%s)\nПовторим её %02d.%02d.%d", groupID, item.Name, item.URL, item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year())
 	m.ParseMode = tgbotapi.ModeMarkdown
 	m.ReplyMarkup = kbForAuthed
 
@@ -665,40 +941,126 @@ func (s *TgServer) createItemConfirm(ctx context.Context, msg *tgbotapi.Message)
 	return err
 }
 
-func (s *TgServer) defaultMessage(ctx context.Context, msg *tgbotapi.Message) error {
-	group := forGroup(ctx)
+// leave group functions
 
-	newModuleRegex := regexp.MustCompile(`^(?:Я изучаю|Studying) ([\w\dА-Яа-я ():,.\-\\/&]{3,128}) (?:на|on) Quizlet: (http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+)$`)
+func (s *TgServer) leaveGroupChoseGroup(ctx context.Context, msg *tgbotapi.Message) error {
+	kb := kbForAuthed
+	kb.OneTimeKeyboard = true
 
-	switch {
-	case group != nil && newModuleRegex.MatchString(msg.Text):
-		values := newModuleRegex.FindAllStringSubmatch(msg.Text, 1)
-		name := values[0][1]
-		url := values[0][2]
+	groups := forGroup(ctx)
 
-		m := tgbotapi.NewMessage(msg.Chat.ID, "")
+	m := tgbotapi.NewMessage(msg.Chat.ID, "")
 
-		item, err := s.db.CreateItem(ctx, group.ID, url, name)
-
+	if groups == nil {
+		m.Text = msgYouDoNotBelongToAnyGroup
+		_, err := s.api.Send(m)
+		return err
+	} else if len(groups) == 1 {
+		m.Text = fmt.Sprintf("Выбрана группа √%d", groups[0].ID)
+		_, err := s.api.Send(m)
 		if err != nil {
-			log.WithError(err).Error("Failed to create item")
-			m.Text = "Тэкс... Я не смогу записать... Повторите, пожалуйста, еще раз..."
-			_, err := s.api.Send(m)
+			return err
+		}
+
+		err = s.db.RemoveUserFromGroup(ctx, msg.From.ID, groups[0].ID)
+		if err != nil {
+			return err
+		}
+		if err != nil {
+			m.Text = "Произошла неизвестная ошибка при выходе из группы, попробуйте ещё раз"
+			_, err = s.api.Send(m)
 			return err
 		}
 
 		s.stats.Set(msg.From.ID, UStatusUndefined)
 
-		m.Text = fmt.Sprintf("Отлично! Карточка добавлена :)\nНазвание: %s\nСсылка: [тыц](%s)\nПовторим её %d.%d.%d", item.Name, item.URL, item.RepeatAt.Day(), item.RepeatAt.Month(), item.RepeatAt.Year())
-		m.ParseMode = tgbotapi.ModeMarkdown
-		m.ReplyMarkup = kbForAuthed
-
+		m.Text = fmt.Sprintf("Вы вышли из группы √%d", groups[0].ID)
+		m.ReplyMarkup = kb
 		_, err = s.api.Send(m)
 		return err
+	}
+
+	groupID, err := strconv.Atoi(msg.Text)
+
+	if err != nil {
+		m.Text = "Вы уверены, что ввели число без всяких знаков? Повторите, пожалуйста, ещё раз"
+		_, err = s.api.Send(m)
+		return err
+	}
+
+	var allowed bool
+
+	for _, group := range groups {
+		if group.ID == groupID {
+			allowed = true
+			break
+		}
+	}
+
+	if !allowed {
+		m.Text = fmt.Sprintf("Вы не входите в группу √%d", groupID)
+		_, err = s.api.Send(m)
+		return err
+	}
+
+	err = s.db.RemoveUserFromGroup(ctx, msg.From.ID, groupID)
+
+	if err != nil {
+		m.Text = "Произошла неизвестная ошибка при выходе из группы, попробуйте ещё раз"
+		_, err = s.api.Send(m)
+		return err
+	}
+
+	s.stats.Set(msg.From.ID, UStatusUndefined)
+
+	m.Text = fmt.Sprintf("Вы вйшли из группы √%d", groupID)
+	m.ReplyMarkup = kb
+	_, err = s.api.Send(m)
+	return err
+}
+
+// default
+
+func (s *TgServer) defaultMessage(ctx context.Context, msg *tgbotapi.Message) error {
+	groups := forGroup(ctx)
+
+	switch {
+	case len(groups) == 1 && newModuleRegex.MatchString(msg.Text):
+		s.userContexts.Set(msg.From.ID, "CreateFullItem_Module", msg.Text)
+		s.userContexts.Set(msg.From.ID, "CreateFullItem_Group", strconv.Itoa(groups[0].ID))
+
+		return s.createFullItemProcess(ctx, msg)
+	case len(groups) > 1 && newModuleRegex.MatchString(msg.Text):
+		s.userContexts.Set(msg.From.ID, "CreateFullItem_Module", msg.Text)
+
+		m := tgbotapi.NewMessage(msg.Chat.ID, "")
+
+		m.Text = "Введите номер группы, в которую хотите добавить эту карточку"
+		_, err := s.api.Send(m)
+
+		if err != nil {
+			return err
+		}
+
+		m.Text = "Вы находитесь в группах √"
+
+		for _, group := range groups {
+			m.Text += fmt.Sprintf("%d, ", group.ID)
+		}
+
+		m.Text = m.Text[:len(m.Text)-2] // Удаляем лишнюю запятую и пробел
+
+		_, err = s.api.Send(m)
+		if err != nil {
+			return err
+		}
+
+		s.stats.Set(msg.From.ID, UStatusCreateFullItemChoseGroup)
+		return nil
 	default:
 		m := tgbotapi.NewMessage(msg.Chat.ID, "Не понимаю, что вы имели в виду...")
 
-		if group != nil {
+		if groups != nil {
 			m.ReplyMarkup = kbForAuthed
 		} else {
 			m.ReplyMarkup = kbForNew
