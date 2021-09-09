@@ -74,6 +74,8 @@ func NewPostgres(connString string) (*Postgres, error) {
 		return nil, err
 	}
 
+	_, err = conn.Exec(context.Background(), `SET TIME ZONE +7`)
+
 	p := Postgres(*conn)
 
 	return &p, nil

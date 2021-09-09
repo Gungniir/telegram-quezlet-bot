@@ -14,6 +14,8 @@ type Ticker struct {
 	db  database.Database
 }
 
+var loc = time.FixedZone("Asia/Krasnoyarsk", 60*60*7)
+
 func (t *Ticker) StartTicker(api *tgbotapi.BotAPI, db database.Database) {
 	t.api = api
 	t.db = db
@@ -22,8 +24,8 @@ func (t *Ticker) StartTicker(api *tgbotapi.BotAPI, db database.Database) {
 
 	go func() {
 		for {
-			now := time.Now().UTC()
-			to := time.Date(now.Year(), now.Month(), now.Day()+1, 3, 0, 0, 0, time.UTC)
+			now := time.Now().In(loc)
+			to := time.Date(now.Year(), now.Month(), now.Day()+1, 4, 30, 0, 0, loc)
 
 			log.Infof("Sleep until %s", to)
 
