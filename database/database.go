@@ -3,11 +3,14 @@ package database
 import (
 	"context"
 	"github.com/gungniir/telegram-quezlet-bot/models"
+	"time"
 )
 
 type Database interface {
 	CreateGroup(ctx context.Context, passwordHash string) (*models.Group, error)
 	GetGroup(ctx context.Context, groupID int) (*models.Group, error)
+
+	GetDate(ctx context.Context) (*time.Time, error)
 
 	AddUserToGroup(ctx context.Context, userID, groupID int) error
 	RemoveUserFromGroup(ctx context.Context, userID, groupID int) error

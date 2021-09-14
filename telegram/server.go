@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var newModuleRegex = regexp.MustCompile(`^(?:Я изучаю|Studying) ([\w\dА-Яа-я ():,.\-\\/&]{3,128}) (?:на|on) Quizlet: (http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+)$`)
@@ -50,7 +51,8 @@ var (
 )
 
 type TgServerConfig struct {
-	Token string
+	Token    string
+	Timezone *time.Location
 }
 
 type TgServer struct {
@@ -64,6 +66,10 @@ type TgServer struct {
 
 func (s *TgServer) ListenAndServe(db database.Database) error {
 	api, err := tgbotapi.NewBotAPI(s.Config.Token)
+
+	if err != nil {
+		return err
+	}
 
 	wbInfo, err := api.GetWebhookInfo()
 
@@ -82,6 +88,7 @@ func (s *TgServer) ListenAndServe(db database.Database) error {
 	s.db = db
 
 	s.ticker = new(Ticker)
+	s.ticker.timezone = s.Config.Timezone
 	s.ticker.StartTicker(api, db)
 
 	updates, err := api.GetUpdatesChan(tgbotapi.NewUpdate(0))
@@ -136,6 +143,8 @@ func (s *TgServer) listenUpdates(updates tgbotapi.UpdatesChannel) error {
 				err = s.commandCreateItem(ctx, update.Message)
 			case "tick":
 				err = s.commandTick(ctx, update.Message)
+			case "time":
+				err = s.commandTime(ctx, update.Message)
 			}
 
 			if err != nil {
@@ -447,6 +456,26 @@ func (s *TgServer) commandTick(_ context.Context, msg *tgbotapi.Message) error {
 	m.ReplyMarkup = kb
 
 	_, err := s.api.Send(m)
+	return err
+}
+
+func (s *TgServer) commandTime(ctx context.Context, msg *tgbotapi.Message) error {
+	nowDB, err := s.db.GetDate(ctx)
+
+	if err != nil {
+		return err
+	}
+
+	nowApp := time.Now().In(s.Config.Timezone)
+
+	m := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Время в приложении: %s\nВремя в базе данных: %s", nowApp.String(), nowDB.String()))
+
+	kb := kbForAuthed
+	kb.OneTimeKeyboard = true
+
+	m.ReplyMarkup = kb
+
+	_, err = s.api.Send(m)
 	return err
 }
 
